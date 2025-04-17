@@ -1,0 +1,1143 @@
+import pandas as pd
+import numpy as np
+import boto3
+from sagemaker import get_execution_role, Session
+import sagemaker
+from sagemaker.xgboost.estimator import XGBoost
+from sklearn.model_selection import train_test_split
+from sklearn.datasets import fetch_california_housing
+
+!pip install xgboost
+ Initialize SageMaker with explicit region (us-east-1)
+region = 'us-east-1'
+boto_session = boto3.Session(region_name=region)
+sess = Session(boto_session=boto_session)
+role = get_execution_role()
+bucket = 'californiahousingprice112'
+  # Your bucket in us-east-1
+with open("requirements.txt", "w") as f:
+    f.write("xgboost==1.6.2\nscikit-learn==1.0.2")
+
+# Verify bucket region (critical)
+s3 = boto3.client('s3', region_name=region)
+try:
+    response = s3.get_bucket_location(Bucket=bucket)
+    print(f"Bucket region: {response.get('LocationConstraint') or 'us-east-1'}")
+except Exception as e:
+    raise ValueError(f"Bucket {bucket} not accessible: {e}")
+Bucket region: us-east-1
+
+# Load and prepare data
+data = fetch_california_housing()
+X_train, X_test, y_train, y_test = train_test_split(data.data, data.target, test_size=0.25, random_state=42)
+
+# Upload to S3 with explicit paths
+train_data = pd.DataFrame(X_train, columns=data.feature_names)
+train_data['target'] = y_train
+test_data = pd.DataFrame(X_test, columns=data.feature_names)
+test_data['target'] = y_test
+
+train_data.to_csv('train.csv', index=False)
+test_data.to_csv('test.csv', index=False)
+
+train_path = sess.upload_data('train.csv', bucket=bucket, key_prefix='data/train')
+test_path = sess.upload_data('test.csv', bucket=bucket, key_prefix='data/test')
+import argparse
+import joblib
+import os
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import numpy as np
+import logging
+from pathlib import Path
+import json
+import sys
+import boto3
+from io import StringIO
+import random
+from datetime import datetime
+import sklearn
+import shutil
+
+# Initialize logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def model_fn(model_dir):
+    """Load the model from the model_dir"""
+    model_path = os.path.join(model_dir, "model.joblib")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found at {model_path}")
+    return joblib.load(model_path)
+
+def parse_args():
+    """Parse command line arguments for Random Forest"""
+    parser = argparse.ArgumentParser()
+    
+    # Common arguments
+    parser.add_argument("--model-dir", type=str, 
+                      default=os.environ.get("SM_MODEL_DIR", "./model"),
+                      help="Directory to save the trained model")
+    parser.add_argument("--train", type=str,
+                      default=os.environ.get("SM_CHANNEL_TRAIN", "./data/train"),
+                      help="Directory containing training data")
+    parser.add_argument("--test", type=str,
+                      default=os.environ.get("SM_CHANNEL_TEST", "./data/test"),
+                      help="Directory containing test data")
+    
+    # Hyperparameter tuning controls
+    parser.add_argument("--n-models", type=int, default=10,
+                      help="Number of hyperparameter combinations to try")
+    parser.add_argument("--seed", type=int, default=42,
+                      help="Random seed for reproducibility")
+    
+    return parser.parse_args()
+
+def load_data_from_s3(s3_path):
+    """Load CSV data from S3 location"""
+    s3 = boto3.client('s3')
+    bucket, key = s3_path.replace("s3://", "").split("/", 1)
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    return pd.read_csv(StringIO(obj['Body'].read().decode('utf-8')))
+
+def load_data(train_path, test_path):
+    """Load and validate training and test data"""
+    try:
+        if train_path.startswith("s3://"):
+            train_df = load_data_from_s3(train_path)
+            test_df = load_data_from_s3(test_path)
+        else:
+            train_df = pd.read_csv(os.path.join(train_path, "train.csv"))
+            test_df = pd.read_csv(os.path.join(test_path, "test.csv"))
+        
+        if "target" not in train_df.columns or "target" not in test_df.columns:
+            raise ValueError("Data must contain 'target' column")
+            
+        return train_df.drop("target", axis=1), train_df["target"], \
+               test_df.drop("target", axis=1), test_df["target"]
+    except Exception as e:
+        logger.error(f"Data loading failed from:\nTrain: {train_path}\nTest: {test_path}\nError: {str(e)}")
+        raise
+
+def generate_random_params(seed):
+    """Generate random hyperparameters for Random Forest"""
+    random.seed(seed)
+    params = {
+        'n_estimators': random.choice([50, 100, 150, 200]),
+        'max_depth': random.choice([3, 5, 7, 9, None]),
+        'min_samples_split': random.choice([2, 5, 10]),
+        'min_samples_leaf': random.choice([1, 2, 4]),
+        'max_features': random.choice(['sqrt', 'log2', None]),
+        'bootstrap': random.choice([True, False])
+    }
+    # Ensure OOB score is only used when bootstrap=True
+    if params['bootstrap']:
+        params['oob_score'] = True
+    else:
+        params['oob_score'] = False
+    return params
+
+def train_model(args):
+    """Main training function with complete deployment artifact saving"""
+    logger.info(f"Loading data from:\nTrain: {args.train}\nTest: {args.test}")
+    X_train, y_train, X_test, y_test = load_data(args.train, args.test)
+    
+    models = []
+    metrics = []
+    
+    # Hyperparameter tuning loop
+    for i in range(args.n_models):
+        params = generate_random_params(args.seed + i)
+        logger.info(f"Training model {i+1}/{args.n_models} with params: {params}")
+        
+        model = RandomForestRegressor(
+            **params,
+            random_state=args.seed + i,
+            n_jobs=-1
+        )
+        
+        model.fit(X_train, y_train)
+        
+        preds = model.predict(X_test)
+        mae = mean_absolute_error(y_test, preds)
+        rmse = np.sqrt(mean_squared_error(y_test, preds))
+        
+        metrics_entry = {
+            'model_index': i,
+            'params': params,
+            'mae': mae,
+            'rmse': rmse,
+            'combined_score': (mae + rmse) / 2
+        }
+        
+        if params['bootstrap']:
+            metrics_entry['oob_score'] = model.oob_score_
+        
+        models.append(model)
+        metrics.append(metrics_entry)
+    
+    # Sort and select third-best model
+    metrics_sorted = sorted(metrics, key=lambda x: x['combined_score'])
+    selected = metrics_sorted[2] if len(metrics_sorted) >= 3 else metrics_sorted[-1]
+    selected_model = models[selected['model_index']]
+    
+    # Create versioned folder
+    version = "v1"
+    model_dir_versioned = os.path.join(args.model_dir, f"random_forest_{version}")
+    os.makedirs(model_dir_versioned, exist_ok=True)
+    
+    # ==============================================
+    # Deployment Artifact Saving
+    # ==============================================
+    
+    # 1. Save Model
+    model_path = os.path.join(model_dir_versioned, "model.joblib")
+    joblib.dump(selected_model, model_path)
+    
+    # 2. Enhanced Metadata (versioned)
+    deployment_metadata = {
+        "model_info": {
+            "model_type": "RandomForestRegressor",
+            "timestamp": datetime.now().isoformat(),
+            "git_commit": os.getenv("GIT_COMMIT", "unknown"),
+            "training_data_path": args.train,
+            "selected_rank": f"{selected['model_index']+1}/{args.n_models}",
+            "feature_count": X_train.shape[1],
+            "training_samples": len(X_train)
+        },
+        "hyperparameters": selected['params'],
+        "metrics": {
+            "mae": selected['mae'],
+            "rmse": selected['rmse'],
+            "combined_score": selected['combined_score'],
+            **({'oob_score': selected['oob_score']} if 'oob_score' in selected else {})
+        },
+        "deployment_schema": {
+            "expected_features": list(X_train.columns),
+            "feature_types": str(X_train.dtypes.to_dict()),
+            "target_type": str(y_train.dtype)
+        }
+    }
+    
+    # Save versioned metadata
+    with open(os.path.join(model_dir_versioned, "metadata.json"), 'w') as f:
+        json.dump(deployment_metadata, f, indent=2)
+    
+    # 3. Save root metadata for backward compatibility
+    root_metadata = {
+        "model_type": "RandomForestRegressor",
+        "metrics": {
+            "mae": selected['mae'],
+            "rmse": selected['rmse']
+        },
+        "model_path": f"random_forest_{version}/model.joblib"
+    }
+    with open(os.path.join(args.model_dir, "selected_model_info.json"), 'w') as f:
+        json.dump(root_metadata, f, indent=2)
+    
+    # 4. Save Requirements
+    with open(os.path.join(model_dir_versioned, "requirements.txt"), 'w') as f:
+        f.write("\n".join([
+            f"scikit-learn=={sklearn.__version__}",
+            f"joblib=={joblib.__version__}",
+            "numpy>=1.21.0",
+            "pandas>=1.3.0"
+        ]))
+    
+    # 5. Save Test Cases
+    os.makedirs(os.path.join(model_dir_versioned, "test_cases"), exist_ok=True)
+    
+    # Input sample
+    with open(os.path.join(model_dir_versioned, "test_cases/input_sample.json"), 'w') as f:
+        json.dump(X_test.iloc[0].to_dict(), f)
+    
+    # Output sample
+    with open(os.path.join(model_dir_versioned, "test_cases/output_sample.json"), 'w') as f:
+        json.dump({"prediction": float(selected_model.predict(X_test[:1])[0])}, f)
+    
+    logger.info(f"\n=== Deployment Artifacts Saved ===")
+    logger.info(f"Versioned artifacts: {model_dir_versioned}")
+    logger.info(f"MAE: {selected['mae']:.4f} | RMSE: {selected['rmse']:.4f}")
+    if 'oob_score' in selected:
+        logger.info(f"OOB Score: {selected['oob_score']:.4f}")
+    logger.info(f"Root metadata: {os.path.join(args.model_dir, 'selected_model_info.json')}")
+
+if __name__ == "__main__":
+    args = parse_args()
+    try:
+        train_model(args)
+    except Exception as e:
+        logger.error(f"Training failed: {str(e)}")
+        raise
+import argparse
+import joblib
+import os
+import pandas as pd
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import numpy as np
+import logging
+from pathlib import Path
+import json
+import sys
+import boto3
+from io import StringIO
+import random
+from datetime import datetime
+import sklearn
+
+# Initialize logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def model_fn(model_dir):
+    """Load the GBDT model from the model_dir"""
+    # Check versioned folder first
+    versioned_path = os.path.join(model_dir, "gbdt_v1", "model.joblib")
+    legacy_path = os.path.join(model_dir, "gbdt_model.joblib")
+    
+    if os.path.exists(versioned_path):
+        return joblib.load(versioned_path)
+    elif os.path.exists(legacy_path):
+        return joblib.load(legacy_path)
+    raise FileNotFoundError(f"No GBDT model found in {model_dir}")
+
+def parse_args():
+    """Parse command line arguments for GBDT"""
+    parser = argparse.ArgumentParser()
+    
+    # Common arguments
+    parser.add_argument("--model-dir", type=str, 
+                      default=os.environ.get("SM_MODEL_DIR", "./model"),
+                      help="Directory to save the trained model")
+    parser.add_argument("--train", type=str,
+                      default=os.environ.get("SM_CHANNEL_TRAIN", "./data/train"),
+                      help="Directory containing training data")
+    parser.add_argument("--test", type=str,
+                      default=os.environ.get("SM_CHANNEL_TEST", "./data/test"),
+                      help="Directory containing test data")
+    
+    # Hyperparameter tuning controls
+    parser.add_argument("--n-models", type=int, default=10,
+                      help="Number of hyperparameter combinations to try")
+    parser.add_argument("--seed", type=int, default=42,
+                      help="Random seed for reproducibility")
+    
+    return parser.parse_args()
+
+def load_data_from_s3(s3_path):
+    """Load CSV data from S3 location"""
+    s3 = boto3.client('s3')
+    bucket, key = s3_path.replace("s3://", "").split("/", 1)
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    return pd.read_csv(StringIO(obj['Body'].read().decode('utf-8')))
+
+def load_data(train_path, test_path):
+    """Load and validate training and test data"""
+    try:
+        if train_path.startswith("s3://"):
+            train_df = load_data_from_s3(train_path)
+            test_df = load_data_from_s3(test_path)
+        else:
+            train_df = pd.read_csv(os.path.join(train_path, "train.csv"))
+            test_df = pd.read_csv(os.path.join(test_path, "test.csv"))
+        
+        if "target" not in train_df.columns or "target" not in test_df.columns:
+            raise ValueError("Data must contain 'target' column")
+            
+        return train_df.drop("target", axis=1), train_df["target"], \
+               test_df.drop("target", axis=1), test_df["target"]
+    except Exception as e:
+        logger.error(f"Data loading failed from:\nTrain: {train_path}\nTest: {test_path}\nError: {str(e)}")
+        raise
+
+def generate_random_params(seed):
+    """Generate random hyperparameters for GBDT"""
+    random.seed(seed)
+    return {
+        'n_estimators': random.choice([50, 100, 150, 200]),
+        'learning_rate': random.choice([0.001, 0.01, 0.05, 0.1, 0.2]),
+        'max_depth': random.choice([3, 5, 7, 9]),
+        'min_samples_split': random.choice([2, 5, 10]),
+        'min_samples_leaf': random.choice([1, 2, 4]),
+        'max_features': random.choice(['sqrt', 'log2', None]),
+        'subsample': random.choice([0.8, 0.9, 1.0]),
+        'loss': 'squared_error'
+    }
+
+def train_model(args):
+    """Main training function with validated deployment structure"""
+    logger.info(f"Loading data from:\nTrain: {args.train}\nTest: {args.test}")
+    X_train, y_train, X_test, y_test = load_data(args.train, args.test)
+    
+    models = []
+    metrics = []
+    
+    # Hyperparameter tuning loop
+    for i in range(args.n_models):
+        params = generate_random_params(args.seed + i)
+        logger.info(f"Training GBDT model {i+1}/{args.n_models} with params: {params}")
+        
+        model = GradientBoostingRegressor(**params, random_state=args.seed + i)
+        model.fit(X_train, y_train)
+        
+        preds = model.predict(X_test)
+        metrics_entry = {
+            'model_index': i,
+            'params': params,
+            'mae': mean_absolute_error(y_test, preds),
+            'rmse': np.sqrt(mean_squared_error(y_test, preds))
+        }
+        metrics_entry['combined_score'] = (metrics_entry['mae'] + metrics_entry['rmse']) / 2
+        models.append(model)
+        metrics.append(metrics_entry)
+    
+    # Select third-best model
+    metrics_sorted = sorted(metrics, key=lambda x: x['combined_score'])
+    selected_index = 2 if len(metrics_sorted) >= 3 else -1
+    selected = metrics_sorted[selected_index]
+    selected_model = models[selected['model_index']]
+
+    # Create versioned deployment package
+    version = "v1"
+    model_dir_versioned = os.path.join(args.model_dir, f"gbdt_{version}")
+    os.makedirs(model_dir_versioned, exist_ok=True)
+
+    # 1. Save model
+    model_path = os.path.join(model_dir_versioned, "model.joblib")
+    joblib.dump(selected_model, model_path)
+
+    # 2. Create validated metadata
+    deployment_metadata = {
+        "model_info": {
+            "model_type": "GradientBoostingRegressor",
+            "timestamp": datetime.now().isoformat() + "Z",
+            "git_commit": os.getenv("GIT_COMMIT", "unknown"),
+            "training_data_path": args.train,
+            "selected_rank": selected_index + 1,
+            "feature_count": X_train.shape[1],
+            "training_samples": len(X_train),
+            "model_ranking": [
+                {
+                    'rank': idx+1,
+                    'hyperparameters': m['params'],
+                    'metrics': {
+                        'mae': m['mae'],
+                        'rmse': m['rmse'],
+                        'combined_score': m['combined_score']
+                    }
+                } for idx, m in enumerate(metrics_sorted)
+            ]
+        },
+        "deployment_schema": {
+            "expected_features": list(X_train.columns),
+            "feature_types": X_train.dtypes.apply(lambda x: x.name).to_dict(),
+            "target_type": y_train.dtype.name,
+            "example_prediction": {
+                "input": X_test.iloc[0].to_dict(),
+                "output": float(selected_model.predict(X_test[:1])[0])
+            }
+        }
+    }
+
+    with open(os.path.join(model_dir_versioned, "metadata.json"), 'w') as f:
+        json.dump(deployment_metadata, f, indent=2, default=str)
+
+    # 3. Save requirements
+    with open(os.path.join(model_dir_versioned, "requirements.txt"), 'w') as f:
+        f.write("\n".join([
+            f"scikit-learn=={sklearn.__version__}",
+            f"joblib=={joblib.__version__}",
+            "numpy>=1.21.0",
+            "pandas>=1.3.0"
+        ]))
+
+    # 4. Save test cases
+    os.makedirs(os.path.join(model_dir_versioned, "test_cases"), exist_ok=True)
+    with open(os.path.join(model_dir_versioned, "test_cases/input_sample.json"), 'w') as f:
+        json.dump(X_test.iloc[0].to_dict(), f)
+    with open(os.path.join(model_dir_versioned, "test_cases/output_sample.json"), 'w') as f:
+        json.dump({"prediction": float(selected_model.predict(X_test[:1])[0])}, f)
+
+    # 5. Save legacy metadata
+    with open(os.path.join(args.model_dir, "gbdt_model_info.json"), 'w') as f:
+        json.dump({
+            "model_type": "GradientBoostingRegressor",
+            "metrics": selected,
+            "model_path": f"gbdt_{version}/model.joblib"
+        }, f, indent=2)
+
+    logger.info(f"\n=== GBDT Deployment Package Saved ===")
+    logger.info(f"Versioned artifacts: {model_dir_versioned}")
+    logger.info(f"MAE: {selected['mae']:.4f} | RMSE: {selected['rmse']:.4f}")
+    logger.info(f"Model path: {model_path}")
+    logger.info(f"Full metadata: {os.path.join(model_dir_versioned, 'metadata.json')}")
+
+if __name__ == "__main__":
+    args = parse_args()
+    try:
+        train_model(args)
+    except Exception as e:
+        logger.error(f"GBDT training failed: {str(e)}")
+        raise
+import argparse
+import joblib
+import os
+import pandas as pd
+import xgboost as xgb
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import numpy as np
+import logging
+from pathlib import Path
+import json
+import sys
+import boto3
+from io import StringIO
+import random
+from datetime import datetime
+import xgboost as xgb
+import sklearn
+
+# Initialize logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def model_fn(model_dir):
+    """Load the XGBoost model from the model_dir"""
+    # Check versioned folder first
+    versioned_path = os.path.join(model_dir, "xgb_v1", "model.joblib")
+    legacy_path = os.path.join(model_dir, "xgb_model.joblib")
+    
+    if os.path.exists(versioned_path):
+        return joblib.load(versioned_path)
+    elif os.path.exists(legacy_path):
+        return joblib.load(legacy_path)
+    raise FileNotFoundError(f"No XGBoost model found in {model_dir}")
+
+def parse_args():
+    """Parse command line arguments for XGBoost"""
+    parser = argparse.ArgumentParser()
+    
+    # Common arguments
+    parser.add_argument("--model-dir", type=str, 
+                      default=os.environ.get("SM_MODEL_DIR", "./model"),
+                      help="Directory to save the trained model")
+    parser.add_argument("--train", type=str,
+                      default=os.environ.get("SM_CHANNEL_TRAIN", "./data/train"),
+                      help="Directory containing training data")
+    parser.add_argument("--test", type=str,
+                      default=os.environ.get("SM_CHANNEL_TEST", "./data/test"),
+                      help="Directory containing test data")
+    
+    # Hyperparameter tuning controls
+    parser.add_argument("--n-models", type=int, default=10,
+                      help="Number of hyperparameter combinations to try")
+    parser.add_argument("--seed", type=int, default=42,
+                      help="Random seed for reproducibility")
+    
+    return parser.parse_args()
+
+def load_data_from_s3(s3_path):
+    """Load CSV data from S3 location"""
+    s3 = boto3.client('s3')
+    bucket, key = s3_path.replace("s3://", "").split("/", 1)
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    return pd.read_csv(StringIO(obj['Body'].read().decode('utf-8')))
+
+def load_data(train_path, test_path):
+    """Load and validate training and test data"""
+    try:
+        if train_path.startswith("s3://"):
+            train_df = load_data_from_s3(train_path)
+            test_df = load_data_from_s3(test_path)
+        else:
+            train_df = pd.read_csv(os.path.join(train_path, "train.csv"))
+            test_df = pd.read_csv(os.path.join(test_path, "test.csv"))
+        
+        if "target" not in train_df.columns or "target" not in test_df.columns:
+            raise ValueError("Data must contain 'target' column")
+            
+        return train_df.drop("target", axis=1), train_df["target"], \
+               test_df.drop("target", axis=1), test_df["target"]
+    except Exception as e:
+        logger.error(f"Data loading failed from:\nTrain: {train_path}\nTest: {test_path}\nError: {str(e)}")
+        raise
+
+def generate_random_params(seed):
+    """Generate random hyperparameters for XGBoost"""
+    random.seed(seed)
+    return {
+        'n_estimators': random.choice([50, 100, 150, 200]),
+        'learning_rate': random.choice([0.001, 0.01, 0.05, 0.1, 0.2]),
+        'max_depth': random.choice([3, 5, 7, 9]),
+        'min_child_weight': random.choice([1, 2, 3]),
+        'gamma': random.choice([0, 0.1, 0.2]),
+        'subsample': random.choice([0.6, 0.8, 1.0]),
+        'colsample_bytree': random.choice([0.6, 0.8, 1.0]),
+        'reg_alpha': random.choice([0, 0.1, 1]),
+        'reg_lambda': random.choice([0.1, 1, 10]),
+        'objective': 'reg:squarederror',
+        'random_state': seed,
+        'early_stopping_rounds': 10
+    }
+
+def train_model(args):
+    """Main training function with validated deployment structure"""
+    logger.info(f"Loading data from:\nTrain: {args.train}\nTest: {args.test}")
+    X_train, y_train, X_test, y_test = load_data(args.train, args.test)
+    
+    models = []
+    metrics = []
+    
+    # Hyperparameter tuning loop
+    for i in range(args.n_models):
+        params = generate_random_params(args.seed + i)
+        logger.info(f"Training XGBoost model {i+1}/{args.n_models} with params: {params}")
+        
+        # Separate early_stopping_rounds from other params
+        early_stopping = params.pop('early_stopping_rounds')
+        
+        model = xgb.XGBRegressor(**params)
+        model.fit(X_train, y_train,
+                 eval_set=[(X_test, y_test)],
+                 verbose=False)
+        
+        preds = model.predict(X_test)
+        metrics_entry = {
+            'model_index': i,
+            'params': params,
+            'mae': mean_absolute_error(y_test, preds),
+            'rmse': np.sqrt(mean_squared_error(y_test, preds))
+        }
+        metrics_entry['combined_score'] = (metrics_entry['mae'] + metrics_entry['rmse']) / 2
+        models.append(model)
+        metrics.append(metrics_entry)
+    
+    # Select third-best model
+    metrics_sorted = sorted(metrics, key=lambda x: x['combined_score'])
+    selected_index = 2 if len(metrics_sorted) >= 3 else -1
+    selected = metrics_sorted[selected_index]
+    selected_model = models[selected['model_index']]
+
+    # Create versioned deployment package
+    version = "v1"
+    model_dir_versioned = os.path.join(args.model_dir, f"xgb_{version}")
+    os.makedirs(model_dir_versioned, exist_ok=True)
+
+    # 1. Save model
+    model_path = os.path.join(model_dir_versioned, "model.joblib")
+    joblib.dump(selected_model, model_path)
+
+    # 2. Create validated metadata
+    deployment_metadata = {
+        "model_info": {
+            "model_type": "XGBoostRegressor",
+            "timestamp": datetime.now().isoformat() + "Z",
+            "git_commit": os.getenv("GIT_COMMIT", "unknown"),
+            "training_data_path": args.train,
+            "selected_rank": selected_index + 1,
+            "feature_count": X_train.shape[1],
+            "training_samples": len(X_train),
+            "model_ranking": [
+                {
+                    'rank': idx+1,
+                    'hyperparameters': m['params'],
+                    'metrics': {
+                        'mae': m['mae'],
+                        'rmse': m['rmse'],
+                        'combined_score': m['combined_score']
+                    }
+                } for idx, m in enumerate(metrics_sorted)
+            ]
+        },
+        "deployment_schema": {
+            "expected_features": list(X_train.columns),
+            "feature_types": X_train.dtypes.apply(lambda x: x.name).to_dict(),
+            "target_type": y_train.dtype.name,
+            "example_prediction": {
+                "input": X_test.iloc[0].to_dict(),
+                "output": float(selected_model.predict(X_test[:1])[0])
+            }
+        }
+    }
+
+    with open(os.path.join(model_dir_versioned, "metadata.json"), 'w') as f:
+        json.dump(deployment_metadata, f, indent=2, default=str)
+
+    # 3. Save requirements
+    with open(os.path.join(model_dir_versioned, "requirements.txt"), 'w') as f:
+        f.write("\n".join([
+            f"xgboost=={xgb.__version__}",
+            f"scikit-learn=={sklearn.__version__}",
+            f"joblib=={joblib.__version__}",
+            "numpy>=1.21.0",
+            "pandas>=1.3.0"
+        ]))
+
+    # 4. Save test cases
+    os.makedirs(os.path.join(model_dir_versioned, "test_cases"), exist_ok=True)
+    with open(os.path.join(model_dir_versioned, "test_cases/input_sample.json"), 'w') as f:
+        json.dump(X_test.iloc[0].to_dict(), f)
+    with open(os.path.join(model_dir_versioned, "test_cases/output_sample.json"), 'w') as f:
+        json.dump({"prediction": float(selected_model.predict(X_test[:1])[0])}, f)
+
+    # 5. Save legacy metadata
+    with open(os.path.join(args.model_dir, "xgb_model_info.json"), 'w') as f:
+        json.dump({
+            "model_type": "XGBoostRegressor",
+            "metrics": selected,
+            "model_path": f"xgb_{version}/model.joblib"
+        }, f, indent=2)
+
+    logger.info(f"\n=== XGBoost Deployment Package Saved ===")
+    logger.info(f"Versioned artifacts: {model_dir_versioned}")
+    logger.info(f"MAE: {selected['mae']:.4f} | RMSE: {selected['rmse']:.4f}")
+    logger.info(f"Model path: {model_path}")
+    logger.info(f"Full metadata: {os.path.join(model_dir_versioned, 'metadata.json')}")
+
+if __name__ == "__main__":
+    args = parse_args()
+    try:
+        train_model(args)
+    except Exception as e:
+        logger.error(f"XGBoost training failed: {str(e)}")
+        raise
+import os
+import json
+import joblib
+from pathlib import Path
+
+def check_deployment_readiness(model_dir):
+    """
+    Check if a model follows the deployment structure:
+    
+    model_dir/
+    ├── {model_name}_v1/
+    │   ├── model.joblib
+    │   ├── metadata.json
+    │   ├── requirements.txt
+    │   └── test_cases/
+    │       ├── input_sample.json
+    │       └── output_sample.json
+    """
+    results = {}
+    
+    # Check for versioned folders
+    for folder in os.listdir(model_dir):
+        if not os.path.isdir(os.path.join(model_dir, folder)):
+            continue
+            
+        # Check if folder follows {model_name}_v{num} pattern
+        if '_v' in folder:
+            model_name = folder.split('_v')[0]
+            version = folder.split('_v')[1]
+            results[folder] = {'status': True, 'missing': []}
+            
+            # Required files
+            required_files = [
+                'model.joblib',
+                'metadata.json',
+                'requirements.txt',
+                'test_cases/input_sample.json',
+                'test_cases/output_sample.json'
+            ]
+            
+            # Check each required file
+            for file in required_files:
+                if not os.path.exists(os.path.join(model_dir, folder, file)):
+                    results[folder]['status'] = False
+                    results[folder]['missing'].append(file)
+            
+            # Validate metadata content if file exists
+            meta_path = os.path.join(model_dir, folder, 'metadata.json')
+            if os.path.exists(meta_path):
+                with open(meta_path) as f:
+                    metadata = json.load(f)
+                
+                required_metadata = [
+                    'model_info.model_type',
+                    'model_info.timestamp',
+                    'deployment_schema.expected_features'
+                ]
+                
+                for field in required_metadata:
+                    keys = field.split('.')
+                    current = metadata
+                    for key in keys:
+                        if key not in current:
+                            results[folder]['status'] = False
+                            results[folder]['missing'].append(f'metadata.{field}')
+                            break
+                        current = current[key]
+    
+    return results
+
+def print_deployment_status(results):
+    """Print formatted deployment readiness report"""
+    print("\n=== Deployment Readiness Report ===")
+    for model, data in results.items():
+        status = "✅ READY" if data['status'] else "❌ NOT READY"
+        print(f"\nModel: {model} - {status}")
+        if not data['status']:
+            print("Missing/Critical Files:")
+            for item in data['missing']:
+                print(f"  - {item}")
+
+# Usage example
+if __name__ == "__main__":
+    model_directory = "./model"  # Change to your model directory
+    readiness_report = check_deployment_readiness(model_directory)
+    print_deployment_status(readiness_report)
+import os
+import shutil
+import json
+from datetime import datetime
+
+def deploy_xgboost_model(model_dir):
+    """Deploy the XGBoost model as it showed best performance"""
+    version = 'v1'
+    model_type = 'xgb'
+    source_dir = os.path.join(model_dir, f"{model_type}_{version}")
+    deploy_dir = os.path.join(model_dir, 'deployment')
+    
+    # Verify model exists
+    if not os.path.exists(os.path.join(source_dir, "model.joblib")):
+        raise FileNotFoundError(f"XGBoost model not found at {source_dir}")
+    
+    # Prepare deployment directory
+    if os.path.exists(deploy_dir):
+        shutil.rmtree(deploy_dir)
+    os.makedirs(deploy_dir)
+    
+    # Copy all model artifacts
+    shutil.copytree(source_dir, os.path.join(deploy_dir, 'model'))
+    
+    # Create deployment info
+    deployment_info = {
+        'deployed_model': 'xgboost',
+        'deployment_time': datetime.now().isoformat(),
+        'metrics': {
+            'mae': 0.3137,
+            'rmse': 0.4680
+        },
+        'reason': 'Selected for having lowest MAE and RMSE among all models',
+        'comparison': {
+            'xgboost': {'mae': 0.3137, 'rmse': 0.4680},
+            'gbdt': {'mae': 0.3206, 'rmse': 0.4776},
+            'random_forest': {'mae': 0.3805, 'rmse': 0.5581}
+        }
+    }
+    
+    with open(os.path.join(deploy_dir, 'deployment_info.json'), 'w') as f:
+        json.dump(deployment_info, f, indent=2)
+    
+    print(f"\n=== XGBoost Model Deployed ===")
+    print(f"Source: {source_dir}")
+    print(f"Deployment package: {deploy_dir}")
+    print(f"MAE: 0.3137 | RMSE: 0.4680")
+
+if __name__ == "__main__":
+    model_dir = "./model"  # Update if your path is different
+    try:
+        deploy_xgboost_model(model_dir)
+    except Exception as e:
+        print(f"Deployment failed: {str(e)}")
+        raise
+%%writefile inference.py
+import json
+import joblib
+import os
+import pandas as pd
+
+def model_fn(model_dir):
+    """Load model from disk"""
+    return joblib.load(os.path.join(model_dir, "model.joblib"))
+
+def input_fn(input_data, content_type):
+    """Parse input data (supports JSON only)"""
+    if content_type == "application/json":
+        return pd.read_json(input_data, orient="records")
+    else:
+        raise ValueError(f"Unsupported content type: {content_type}")
+
+def predict_fn(input_data, model):
+    """Make predictions"""
+    return model.predict(input_data)
+
+def output_fn(prediction, accept):
+    """Format output"""
+    if accept == "application/json":
+        return json.dumps(prediction.tolist())
+    else:
+        raise ValueError(f"Unsupported accept type: {accept}")
+import boto3
+import os
+import tarfile
+import joblib
+
+# 1. Save your trained model locally
+model = ...  # Your trained XGBoost model
+model_filename = 'model.joblib'
+joblib.dump(model, model_filename)
+
+# 2. Create model directory structure
+model_dir = 'xgboost_model'
+os.makedirs(model_dir, exist_ok=True)
+os.rename(model_filename, os.path.join(model_dir, model_filename))
+
+# 3. Add inference script (created earlier)
+with open(os.path.join(model_dir, 'inference.py'), 'w') as f:
+    f.write('''import joblib
+import os
+import pandas as pd
+
+def model_fn(model_dir):
+    return joblib.load(os.path.join(model_dir, "model.joblib"))
+
+def input_fn(input_data, content_type):
+    if content_type == "application/json":
+        return pd.read_json(input_data, orient="records")
+    raise ValueError(f"Unsupported content type: {content_type}")
+
+def predict_fn(input_data, model):
+    return model.predict(input_data)''')
+
+# 4. Create requirements.txt
+with open(os.path.join(model_dir, 'requirements.txt'), 'w') as f:
+    f.write('scikit-learn==1.0.2\npandas==1.3.5')
+
+# 5. Create tar.gz package
+with tarfile.open('model.tar.gz', 'w:gz') as tar:
+    tar.add(model_dir, arcname=os.path.basename(model_dir))
+
+# 6. Upload to S3
+s3 = boto3.client('s3')
+s3_key = "models/xgboost/model.tar.gz"
+s3.upload_file('model.tar.gz', 'californiahousingprice112', s3_key)
+model_s3_path = f"s3://californiahousingprice112/{s3_key}"
+print(f"Model uploaded to: {model_s3_path}")
+!tar -tvzf model.tar.gz
+# Should show:
+# - model.joblib
+# - inference.py
+# - requirements.txt (optional)
+import tarfile
+import os
+from pathlib import Path
+
+# 1. Create clean temporary directory
+temp_dir = Path('temp_package')
+temp_dir.mkdir(exist_ok=True)
+
+# 2. Copy files (using Path for cross-platform compatibility)
+files_to_copy = ['inference.py', 'model.joblib', 'requirements.txt']
+for file in files_to_copy:
+    Path(f'xgboost_model/{file}').rename(temp_dir/file)
+
+# 3. Create tar.gz without root directory
+with tarfile.open('model_proper.tar.gz', 'w:gz') as tar:
+    for file in temp_dir.glob('*'):
+        tar.add(file, arcname=file.name)  # Add each file individually
+
+# 4. Verify structure
+print("Final package contents:")
+!tar -tvzf model_proper.tar.gz
+
+# 5. Upload to S3
+s3 = boto3.client('s3')
+s3.upload_file(
+    'model_proper.tar.gz',
+    'californiahousingprice112',
+    'models/xgboost/model_proper.tar.gz'
+)
+import tarfile
+import os
+
+# Create correct directory structure
+os.makedirs('package', exist_ok=True)
+
+# Copy files to root of package directory
+!cp xgboost_model/inference.py package/
+!cp xgboost_model/model.joblib package/
+!cp xgboost_model/requirements.txt package/
+
+# Create new properly structured tar.gz
+with tarfile.open('correct_model.tar.gz', 'w:gz') as tar:
+    tar.add('package/inference.py', arcname='inference.py')
+    tar.add('package/model.joblib', arcname='model.joblib')
+    tar.add('package/requirements.txt', arcname='requirements.txt')
+
+# Verify contents
+!tar -tzvf correct_model.tar.gz
+!aws s3 cp correct_model.tar.gz s3://californiahousingprice112/models/xgboost/correct_model.tar.gz
+# inference.py - must be in root of package
+import joblib
+import os
+import numpy as np
+
+def model_fn(model_dir):
+    """Load model from model.joblib"""
+    model_path = os.path.join(model_dir, 'model.joblib')
+    return joblib.load(model_path)
+
+def input_fn(input_data, content_type):
+    """Parse input data"""
+    if content_type == 'application/json':
+        import json
+        data = json.loads(input_data)
+        return np.array(data['features']).reshape(1, -1)
+    else:
+        raise ValueError(f"Unsupported content type: {content_type}")
+
+def predict_fn(input_data, model):
+    """Make prediction"""
+    return model.predict(input_data)
+
+def output_fn(prediction, accept):
+    """Format output"""
+    if accept == 'application/json':
+        return json.dumps(prediction.tolist())
+    else:
+        raise ValueError(f"Unsupported accept type: {accept}")
+import sagemaker
+from sagemaker.xgboost import XGBoostModel
+from time import gmtime, strftime
+
+# 1. Create unique endpoint name with timestamp
+endpoint_name = f"california-housing-{strftime('%Y-%m-%d-%H-%M-%S', gmtime())}"
+
+# 2. Configure model with debug settings
+model = XGBoostModel(
+    model_data="s3://californiahousingprice112/models/xgboost/correct_model.tar.gz",
+    role=sagemaker.get_execution_role(),
+    framework_version="1.3-1",
+    entry_point="inference.py",
+    py_version="py3",
+    name=f"{endpoint_name}-model",
+    env={
+        "SAGEMAKER_CONTAINER_LOG_LEVEL": "20",  # Debug logging
+        "SAGEMAKER_ENABLE_CLOUDWATCH_METRICS": "true",
+        "SAGEMAKER_PROGRAM": "inference.py"  # Explicitly set entry point
+    }
+)
+
+# 3. Deploy with extended timeouts
+try:
+    predictor = model.deploy(
+        initial_instance_count=1,
+        instance_type="ml.m5.large",
+        endpoint_name=endpoint_name,
+        wait=True,
+        health_check_timeout=1200,  # 20 minutes timeout
+        container_startup_health_check_timeout=1200,
+        model_data_download_timeout=1200
+    )
+    
+    print(f"✅ Endpoint '{endpoint_name}' deployed successfully")
+    
+except Exception as e:
+    print(f"❌ Deployment failed: {str(e)}")
+    print("\nTROUBLESHOOTING STEPS:")
+    print("1. Check CloudWatch logs for errors:")
+    print(f"   !aws logs tail /aws/sagemaker/Endpoints/{endpoint_name}")
+    print("2. Verify inference.py handles the input format correctly")
+    print("3. Test model loading locally:")
+    print("   import joblib; joblib.load('model.joblib')")
+import boto3
+from pprint import pprint
+from datetime import datetime
+
+# Create SageMaker client
+sm_client = boto3.client('sagemaker')
+
+# Get endpoint details
+endpoint_name = 'california-housing-2025-04-03-08-13-00'
+endpoint_info = sm_client.describe_endpoint(EndpointName=endpoint_name)
+
+# Print all available endpoint info
+print("=== Full Endpoint Info ===")
+pprint(endpoint_info)
+
+# Get endpoint configuration details
+endpoint_config_name = endpoint_info['EndpointConfigName']
+endpoint_config = sm_client.describe_endpoint_config(EndpointConfigName=endpoint_config_name)
+
+print("\n=== Endpoint Configuration ===")
+pprint(endpoint_config)
+
+# Get production variant details
+variant = endpoint_config['ProductionVariants'][0]
+print("\n=== Production Variant Details ===")
+print(f"Instance Type: {variant['InstanceType']}")
+print(f"Initial Instance Count: {variant['InitialInstanceCount']}")
+print(f"Model Name: {variant['ModelName']}")
+
+# Verify the model details
+try:
+    model_info = sm_client.describe_model(ModelName=variant['ModelName'])
+    print("\n=== Model Details ===")
+    print(f"Model Name: {model_info['ModelName']}")
+    print(f"Creation Time: {model_info['CreationTime']}")
+    print(f"Container Image: {model_info['PrimaryContainer']['Image']}")
+    if 'xgboost' in model_info['PrimaryContainer']['Image'].lower():
+        print("✅ Confirmed XGBoost Model Deployment")
+    else:
+        print("⚠️ Container image doesn't appear to be XGBoost")
+except Exception as e:
+    print(f"\n❌ Could not verify model: {str(e)}")
+# here it is model deployment code  
+=== Full Endpoint Info ===
+{'CreationTime': datetime.datetime(2025, 4, 3, 8, 13, 3, 10000, tzinfo=tzlocal()),
+ 'EndpointArn': 'arn:aws:sagemaker:us-east-1:390402538284:endpoint/california-housing-2025-04-03-08-13-00',
+ 'EndpointConfigName': 'california-housing-2025-04-03-08-13-00',
+ 'EndpointName': 'california-housing-2025-04-03-08-13-00',
+ 'EndpointStatus': 'InService',
+ 'LastModifiedTime': datetime.datetime(2025, 4, 3, 8, 16, 29, 729000, tzinfo=tzlocal()),
+ 'ProductionVariants': [{'CurrentInstanceCount': 1,
+                         'CurrentWeight': 1.0,
+                         'DeployedImages': [{'ResolutionTime': datetime.datetime(2025, 4, 3, 8, 13, 3, 568000, tzinfo=tzlocal()),
+                                             'ResolvedImage': '683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost@sha256:a0b5e39b3ca335e3c375d75fc91f88b4c97cb3b70a3217e90a759d2b9df52146',
+                                             'SpecifiedImage': '683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:1.3-1'}],
+                         'DesiredInstanceCount': 1,
+                         'DesiredWeight': 1.0,
+                         'VariantName': 'AllTraffic'}],
+ 'ResponseMetadata': {'HTTPHeaders': {'content-length': '758',
+                                      'content-type': 'application/x-amz-json-1.1',
+                                      'date': 'Thu, 03 Apr 2025 08:30:09 GMT',
+                                      'x-amzn-requestid': '782768b8-e402-4b46-bc5a-9e9ff328b15e'},
+                      'HTTPStatusCode': 200,
+                      'RequestId': '782768b8-e402-4b46-bc5a-9e9ff328b15e',
+                      'RetryAttempts': 0}}
+
+=== Endpoint Configuration ===
+{'CreationTime': datetime.datetime(2025, 4, 3, 8, 13, 2, 436000, tzinfo=tzlocal()),
+ 'EnableNetworkIsolation': False,
+ 'EndpointConfigArn': 'arn:aws:sagemaker:us-east-1:390402538284:endpoint-config/california-housing-2025-04-03-08-13-00',
+ 'EndpointConfigName': 'california-housing-2025-04-03-08-13-00',
+ 'ProductionVariants': [{'ContainerStartupHealthCheckTimeoutInSeconds': 1200,
+                         'InitialInstanceCount': 1,
+                         'InitialVariantWeight': 1.0,
+                         'InstanceType': 'ml.m5.large',
+                         'ModelDataDownloadTimeoutInSeconds': 1200,
+                         'ModelName': 'california-housing-2025-04-03-08-13-00-model',
+                         'VariantName': 'AllTraffic'}],
+ 'ResponseMetadata': {'HTTPHeaders': {'content-length': '528',
+                                      'content-type': 'application/x-amz-json-1.1',
+                                      'date': 'Thu, 03 Apr 2025 08:30:09 GMT',
+                                      'x-amzn-requestid': '2469274b-2684-4df8-a7f5-b2df5803c98f'},
+                      'HTTPStatusCode': 200,
+                      'RequestId': '2469274b-2684-4df8-a7f5-b2df5803c98f',
+                      'RetryAttempts': 0}}
+
+=== Production Variant Details ===
+Instance Type: ml.m5.large
+Initial Instance Count: 1
+Model Name: california-housing-2025-04-03-08-13-00-model
+
+=== Model Details ===
+Model Name: california-housing-2025-04-03-08-13-00-model
+Creation Time: 2025-04-03 08:13:02.050000+00:00
+Container Image: 683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-xgboost:1.3-1
+✅ Confirmed XGBoost Model Deployment
+
